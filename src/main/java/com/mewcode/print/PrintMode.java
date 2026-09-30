@@ -169,6 +169,9 @@ public class PrintMode {
             return com.mewcode.teams.Coordinator.isCoordinatorTool(name);
         });
 
+        // 队友还在跑就不许收工（详见 Agent.awaitBusyPeers）
+        agent.setPeersBusyFn(teamManager::hasBusyTeammate);
+
         // 子 Agent 关联
         if (registry.get("Agent") instanceof AgentTool at) {
             at.setProgressListener(progress -> {}); // print 模式不需要进度回调

@@ -207,7 +207,12 @@ public class AgentTool implements Tool {
         ));
         properties.put("prompt", Map.of(
                 "type", "string",
-                "description", "The task for the agent to perform. Be detailed -- the agent has no context from this conversation."
+                "description", "The task for the agent to perform. Be detailed -- the agent has no context "
+                        + "from this conversation. When spawning a TEAM member (team_name set), the prompt "
+                        + "must also carry the interface contract and file boundaries you fixed up front: "
+                        + "the exact signatures, paths and field names it must implement, and what it must "
+                        + "not touch. The teammate cannot negotiate these with its peers — messages only "
+                        + "arrive at turn boundaries, so leaving the contract to be worked out later costs turns."
         ));
         properties.put("subagent_type", Map.of(
                 "type", "string",
@@ -232,9 +237,17 @@ public class AgentTool implements Tool {
                 "type", "string",
                 "description", "REQUIRED when creating team members. Spawns the agent as a long-running "
                         + "teammate under this team (created via TeamCreate). Unlike regular sub-agents, team "
-                        + "members run in their own terminal, persist after the lead returns, and communicate "
-                        + "with each other via SendMessage. Without team_name the agent runs as a one-shot "
-                        + "sub-agent that blocks and returns inline."
+                        + "members persist after the lead returns and communicate with each other via "
+                        + "SendMessage. Without team_name the agent runs as a one-shot sub-agent that blocks "
+                        + "and returns inline."
+        ));
+        properties.put("name", Map.of(
+                "type", "string",
+                "description", "Member name, only meaningful together with team_name. This is the identity "
+                        + "other members and the lead use to reach this member with SendMessage, so whatever "
+                        + "you tell your teammates to call them MUST match this value exactly. Must be unique "
+                        + "within the team; a numeric suffix is appended on collision. Defaults to a slug "
+                        + "derived from description."
         ));
 
         Map<String, Object> inputSchema = new LinkedHashMap<>();
@@ -266,13 +279,22 @@ public class AgentTool implements Tool {
         String modelOverride = getStringArg(args, "model");
         String isolation = getStringArg(args, "isolation");
         String teamName = getStringArg(args, "team_name");
+        String memberName = getStringArg(args, "name");
 
         // Team-member path: check BEFORE fork/subagent so team_name is never skipped.
         if (teamName != null && !teamName.isEmpty() && teamManager != null) {
             SubAgentSpec spec = (subagentType != null && !subagentType.isEmpty())
                     ? resolveSpec(subagentType) : resolveSpec("general-purpose");
             if (spec == null) spec = resolveSpec("general-purpose");
-            return runAsTeammate(spec, teamName, description, prompt, modelOverride, isolation);
+            return runAsTeammate(spec, teamName, memberName, description, prompt, modelOverride, isolation);
+        }
+
+        // `name` 只对团队成员有意义。静默忽略会让 lead 以为自己命名了成员，
+        // 随后把那个名字告诉队友 —— 队友照此发消息就会写进没人读的收件箱。
+        if (memberName != null && !memberName.isEmpty()) {
+            return ToolResult.error("Error: 'name' is only valid together with 'team_name'. "
+                    + "To spawn a named team member, pass team_name (created via TeamCreate) as well. "
+                    + "For a regular sub-agent, drop 'name'.");
         }
 
         // Fork path: no subagent_type specified.
@@ -491,21 +513,15 @@ public class AgentTool implements Tool {
         };
     }
 
-    private ToolResult runAsTeammate(SubAgentSpec spec, String teamName,
+    private ToolResult runAsTeammate(SubAgentSpec spec, String teamName, String requestedName,
                                      String description, String prompt, String modelOverride, String isolation) {
         var team = teamManager.getTeam(teamName);
         if (team == null) {
             return ToolResult.error("Error: team '%s' not found. Create it first with TeamCreate.".formatted(teamName));
         }
 
-        // Deduplicate member name
-        String memberName = description.replaceAll("\\s+", "-").toLowerCase();
-        if (memberName.length() > 30) memberName = memberName.substring(0, 30);
-        int suffix = 2;
-        String base = memberName;
-        while (team.hasMember(memberName)) {
-            memberName = base + "-" + suffix++;
-        }
+        String memberName = resolveMemberName(requestedName, description, team);
+        String role = description.strip();
 
         ToolRegistry subRegistry = ToolFilter.filterForAgent(parentRegistry, spec);
         // Add coordination tools for teammates
@@ -513,8 +529,8 @@ public class AgentTool implements Tool {
 
         LlmClient subClient = selectClient(spec.model(), modelOverride);
 
-        // Gather peer names for addendum
-        var otherMembers = team.memberNames();
+        // Gather peer roster for addendum (名字 + 职责)
+        var otherMembers = team.memberRoster(memberName);
 
         // Build addendum
         String addendum = com.mewcode.teams.TeammateRunner.buildTeammateAddendum(
@@ -542,8 +558,9 @@ public class AgentTool implements Tool {
         try {
             var spawnResult = com.mewcode.teams.SpawnDispatcher.spawnTeammate(
                     new com.mewcode.teams.SpawnDispatcher.SpawnConfig(
-                            team, memberName, prompt, addendum,
-                            subClient, subRegistry, protocol, providerConfig, workdir));
+                            team, memberName, role, prompt, addendum,
+                            subClient, subRegistry, protocol, providerConfig, workdir,
+                            teamManager != null ? teamManager.getTeammateEventSink() : null));
 
             return ToolResult.success(
                     "Teammate \"%s\" spawned in team \"%s\" (mode: %s). The teammate is now working on the assigned task."
@@ -551,6 +568,45 @@ public class AgentTool implements Tool {
         } catch (Exception e) {
             return ToolResult.error("Error spawning teammate: " + e.getMessage());
         }
+    }
+
+    /**
+     * Resolve the member name for a new teammate, guaranteeing it is unique in
+     * {@code team} and safe to use as a file name.
+     *
+     * <p>成员名不只是标签：它同时是收件箱文件名（{@code FileMailBox.inboxPath} 直接拼
+     * {@code <name>.json}）和 SendMessage 的寻址标识。所以显式传入的 {@code name}
+     * 必须优先 —— 之前它被静默丢弃，成员名回落到 description 派生值，导致 lead 把
+     * 「它以为的名字」告诉队友，队友按那个名字发消息就写进了没人会读的收件箱。
+     */
+    static String resolveMemberName(String requestedName, String description,
+                                    com.mewcode.teams.TeamManager.Team team) {
+        String base = sanitizeMemberName(requestedName);
+        if (base == null) {
+            // 无显式 name 时保持旧行为：description 转小写 slug
+            base = sanitizeMemberName(description);
+            if (base != null) base = base.toLowerCase();
+        }
+        if (base == null) base = "member";
+        if (base.length() > 30) base = base.substring(0, 30);
+
+        String name = base;
+        int suffix = 2;
+        while (team.hasMember(name)) {
+            name = base + "-" + suffix++;
+        }
+        return name;
+    }
+
+    /**
+     * 文件名安全化：成员名会被用作 {@code <name>.json}，含路径分隔符或通配符的名字
+     * 会写到别处或直接失败。保留 Unicode 字母（中文成员名可用），只清理危险字符。
+     */
+    private static String sanitizeMemberName(String raw) {
+        if (raw == null || raw.isBlank()) return null;
+        String s = raw.strip().replaceAll("[\\\\/:*?\"<>|\\s]+", "-");
+        s = s.replaceAll("-{2,}", "-").replaceAll("^-+|-+$", "");
+        return s.isEmpty() ? null : s;
     }
 
     private LlmClient selectClient(String specModel, String overrideModel) {

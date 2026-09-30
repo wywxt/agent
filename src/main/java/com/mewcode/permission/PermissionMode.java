@@ -30,6 +30,25 @@ public enum PermissionMode {
         };
     }
 
+    /**
+     * 解析配置里的 {@code permission_mode} 字符串。
+     *
+     * <p>这个字段以前全项目没有任何地方读：TUI 与 remote 都硬编码 {@code DEFAULT}，
+     * 于是配置里写 {@code BYPASS} 也不生效 —— 无人值守跑实验时会一直弹审批等人点，
+     * 而脚本化的运行恰恰没人点。
+     *
+     * <p>无法识别时回落到 {@link #DEFAULT}（逐次询问）而不是 {@code BYPASS}：
+     * 配置写错时宁可多问几句，也不能静默放行。
+     */
+    public static PermissionMode fromConfig(String raw) {
+        if (raw == null || raw.isBlank()) return DEFAULT;
+        try {
+            return valueOf(raw.strip().toUpperCase(java.util.Locale.ROOT));
+        } catch (IllegalArgumentException e) {
+            return DEFAULT;
+        }
+    }
+
     public enum Decision {
         ALLOW, DENY, ASK
     }

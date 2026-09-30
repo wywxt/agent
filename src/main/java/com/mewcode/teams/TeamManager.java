@@ -28,6 +28,27 @@ public class TeamManager {
 
     private final Map<String, Team> teams = new LinkedHashMap<>();
 
+    /**
+     * 队友事件的出口，由外部（{@code RemoteServer}）接线。
+     *
+     * <p>在此之前队友的事件全被投进 {@code TeammateRunner} 里一个局部创建的队列，
+     * 而那个队列**没有任何消费者** —— 写满 32 条后 {@code offer} 静默失败。
+     * 于是队友的 token 用量等数据只能靠 {@code progress.jsonl} 和邮箱两条旁路外流，
+     * 外部观测不到多 agent 的真实成本。
+     *
+     * <p>{@code null} 表示不接线（TUI / PrintMode 即如此），此时
+     * {@code TeammateRunner} 退回局部队列，行为与改动前一致。
+     */
+    private volatile BlockingQueue<AgentEvent> teammateEventSink;
+
+    public void setTeammateEventSink(BlockingQueue<AgentEvent> sink) {
+        this.teammateEventSink = sink;
+    }
+
+    public BlockingQueue<AgentEvent> getTeammateEventSink() {
+        return teammateEventSink;
+    }
+
     public synchronized Team createTeam(String name, TeamMode mode) {
         Team team = new Team(name, mode);
         teams.put(name, team);
@@ -60,6 +81,20 @@ public class TeamManager {
         return teams.values().stream()
                 .flatMap(t -> t.getTeammateProgressList().stream())
                 .toList();
+    }
+
+    /**
+     * 有没有队友正在跑某一轮。给 lead 的收工判定用（{@code Agent.setPeersBusyFn}）。
+     *
+     * <p>判据是 {@link TeammateProgress#isBusy()} 而不是 {@code Member.active}：后者
+     * 只说明队友线程还没退出，而干完一轮的队友会一直阻塞在等消息上 —— 照它判，lead
+     * 会在每个团队任务的尾巴上白等满等待上限。
+     */
+    public synchronized boolean hasBusyTeammate() {
+        for (Team t : teams.values()) {
+            if (t.hasBusyTeammate()) return true;
+        }
+        return false;
     }
 
     public static TeamMode detectBackend() {
@@ -110,10 +145,10 @@ public class TeamManager {
 
         public FileMailBox getMailBox() { return mailBox; }
 
-        public synchronized Member addMember(String name, LlmClient client, ToolRegistry registry,
+        public synchronized Member addMember(String name, String role, LlmClient client, ToolRegistry registry,
                                              String protocol, ProviderConfig cfg) {
             Agent ag = new Agent(client, registry, protocol, cfg);
-            Member member = new Member(name, ag, new ConversationManager());
+            Member member = new Member(name, role, ag, new ConversationManager());
             members.put(name, member);
             return member;
         }
@@ -122,6 +157,8 @@ public class TeamManager {
             Member member = members.get(name);
             if (member == null) return null;
             member.conv.addUserMessage(task);
+            // 与 TeammateRunner.runTurn 同理：usage 累计以 run 为界，跨 run 要标边界。
+            if (member.progress != null) member.progress.beginRun();
             BlockingQueue<AgentEvent> queue = member.agent.run(member.conv);
             member.active = true;
             return queue;
@@ -156,6 +193,20 @@ public class TeamManager {
             return new ArrayList<>(members.keySet());
         }
 
+        /**
+         * 成员名册，每行「名字 —— 职责」。名字是 SendMessage 的寻址标识，职责告诉队友
+         * 谁负责什么 —— 只给名字会让队友知道有谁、却不知道该找谁办哪件事。
+         *
+         * @param excludeName 需要排除的成员（通常是接收名册的成员自己），可为 null
+         */
+        public synchronized List<String> memberRoster(String excludeName) {
+            return members.values().stream()
+                    .filter(m -> excludeName == null || !excludeName.equals(m.name))
+                    .map(m -> (m.role == null || m.role.isBlank())
+                            ? m.name : m.name + " —— " + m.role)
+                    .toList();
+        }
+
         public void sendMessage(String from, String to, String content) {
             mailBox.send(to, new FileMailBox.MailMessage(from, content));
         }
@@ -166,23 +217,38 @@ public class TeamManager {
                     .map(m -> m.progress)
                     .toList();
         }
+
+        /** 队里有没有人正在跑某一轮。外部后端（tmux/iTerm）的成员没有 progress，恒为 false。 */
+        public synchronized boolean hasBusyTeammate() {
+            for (Member m : members.values()) {
+                if (m.progress != null && m.progress.isBusy()) return true;
+            }
+            return false;
+        }
     }
 
     public static class Member {
         public final String name;
+
+        /** 该成员的职责描述，来自 lead 派活时的 description。用于给队友看名册。 */
+        public final String role;
+
         public final Agent agent;
         public final ConversationManager conv;
         public volatile boolean active;
         public volatile Thread thread;
-        public TeammateProgress progress;
+        /** 由队友自己的线程在开跑时挂上；lead 线程会读（收工判定），故 volatile。 */
+        public volatile TeammateProgress progress;
 
-        public Member(String name, Agent agent, ConversationManager conv) {
+        public Member(String name, String role, Agent agent, ConversationManager conv) {
             this.name = name;
+            this.role = role;
             this.agent = agent;
             this.conv = conv;
         }
 
         public String getName() { return name; }
+        public String getRole() { return role; }
         public boolean isActive() { return active; }
     }
 

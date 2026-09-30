@@ -28,7 +28,6 @@ import com.mewcode.permission.PermissionMode;
 import com.mewcode.plan.PlanFile;
 import com.mewcode.prompt.PlanModePrompt;
 import com.mewcode.session.SessionManager;
-import com.mewcode.tool.ToolCategory;
 import com.mewcode.tool.ToolRegistry;
 import com.mewcode.toolresult.ContentReplacementRecord;
 import com.mewcode.toolresult.ContentReplacementState;
@@ -67,6 +66,55 @@ public class Agent {
     private ReportService reportService;
 
     private java.util.function.Predicate<String> toolNameFilter;
+
+    /**
+     * 「还有队友正在跑某一轮吗」—— 由 team 侧注入；null 表示这个 Agent 不属于任何队伍。
+     *
+     * <p>只服务于一处：本轮到底算不算干完了（见 {@link #awaitBusyPeers}）。
+     */
+    private java.util.function.BooleanSupplier peersBusy;
+
+    /**
+     * 等队友的上限。队友可能卡在一个长轮里，但也不能让 lead 无限期挂着 ——
+     * 取 10 分钟，比队友等审批的上限（{@code TeammateRunner.planApprovalTimeoutMs}，
+     * 3 分钟）宽出一档，好让「队友超时后自行开工并跑完一轮」仍落在等待窗口内。
+     */
+    private long peerWaitMs = 10 * 60 * 1000L;
+
+    /** 队友状态的轮询间隔。纯空转，不产生 API 调用。 */
+    private static final long PEER_POLL_MS = 500;
+
+    /**
+     * 队友全部收工之后，lead 还有多久做收尾（集成验收、汇总交付）。
+     *
+     * <p><b>为什么要有这一档：</b>{@link #peersBusy} 让 lead 不再提前收工之后，收尾变成了
+     * 一段**串行**的时间 —— 队友都停了，只有 lead 在跑，它跑多久，整支队伍就多花多久。
+     * 2026-09-25 的 team 实跑里这段是 203 秒（队友 +154s 停工，lead 到 +357s 才收工），
+     * 期间没有并行工作，纯增成本，而且撞上了三次 provider 慢请求（66/71/140s）。
+     *
+     * <p>对照 Claude Code 同一道题的 team 跑法：队友并行跑完 +59.8s，lead 只补了一句
+     * {@code bash verify.sh} 就走了，尾巴 14 秒。差别不在「lead 验得慢」，而在「lead 是
+     * 唯一在串行验收的人」。
+     *
+     * <p>所以策略是**给收尾一个预算**，而不是禁止收尾：预算内照常干，用尽后先提醒一次
+     * 「这一轮必须收工，未验证项如实列出」，再超一轮才强制结束（记 SUCCEEDED，不是 CANCELLED
+     * —— 任务没被取消，只是不再往下验了）。队友消息到来会把预算整档重算：那是外部输入，
+     * 后面的活不是尾巴。
+     */
+    private long tailBudgetMs = 2 * 60 * 1000L;
+
+    /** 收尾预算的截止时刻；0 表示还没起算（队友仍在跑）。 */
+    private long tailDeadlineMs = 0;
+
+    /** 「预算用尽」的提醒是否已经发过 —— 发过之后再多给一轮，然后强制收工。 */
+    private boolean tailReminderSent;
+
+    /** 收尾预算用尽时的收工提醒。 */
+    private static final String TAIL_BUDGET_REMINDER =
+            "[验收预算] 所有队友都已收工，你的收尾时间已用尽。这一轮必须结束并给出最终答复。\n"
+            + "不要再读源码、不要再跑命令去做额外核查 —— 若仍有未验证项，在最终回复里如实列出"
+            + "（哪些没验、为什么没验），而不是继续验证。";
+
     private String instructions = "";
     private String memoryContent = "";
 
@@ -131,6 +179,18 @@ public class Agent {
     public void setReportService(ReportService service) { this.reportService = service; }
 
     public void setToolNameFilter(java.util.function.Predicate<String> filter) { this.toolNameFilter = filter; }
+
+    /** 注入「队友是否正在干活」的判据。不注入时行为与改动前完全一致。 */
+    public void setPeersBusyFn(java.util.function.BooleanSupplier fn) { this.peersBusy = fn; }
+
+    /** 等队友的上限，供测试调小；生产默认 10 分钟。 */
+    public void setPeerWaitMs(long ms) { this.peerWaitMs = ms; }
+
+    /**
+     * 队友全部收工后的收尾预算，供测试调小；生产默认 2 分钟。传 0 关闭这一档
+     * （行为回到「只看本轮有没有工具调用」）。不注入 {@link #peersBusy} 时本来就不生效。
+     */
+    public void setTailBudgetMs(long ms) { this.tailBudgetMs = ms; }
     public void setInstructions(String instructions) { this.instructions = instructions; }
     public void setMemoryContent(String memoryContent) { this.memoryContent = memoryContent; }
     public void setMemoryRecallFuture(CompletableFuture<String> future) {
@@ -200,8 +260,11 @@ public class Agent {
         var pendingAckIds = new ArrayList<String>();
         // 循环看门狗：基于每轮工具签名/产出判断是否陷入重复或空转，由软到硬介入
         var watchdog = new LoopWatchdog();
-        // 第二层进度审查：超轮次预算后异步请小模型判断是否"软空转"（有产出但没方向）
-        var progressReviewer = reportService != null ? new ProgressReviewer(reportService) : null;
+        // 第二层进度审查：超轮次预算后异步请小模型判断是否"软空转"（有产出但没方向）。
+        // 目标在此取一次即可 —— 它就是用户最初要办的事，不随循环变化；但审查员离了它就
+        // 判断不了"有没有方向"，只能靠工具名的表面条理猜（见 循环检测优化设计.md C1）。
+        var progressReviewer = reportService != null
+                ? new ProgressReviewer(reportService, conv.firstUserRequest()) : null;
 
         try {
         for (int iteration = 1; ; iteration++) {
@@ -216,9 +279,30 @@ public class Agent {
             if (Thread.currentThread().isInterrupted()) { cancelled = true; break; }
 
             // Drain background task notifications and inject as system reminders
+            boolean gotNote = false;
             if (notificationFn != null) {
                 for (String note : notificationFn.get()) {
                     conv.addSystemReminder(note);
+                    gotNote = true;
+                }
+            }
+
+            // 收尾预算：队友全收工后，lead 只剩这么多时间（详见 tailBudgetMs）。
+            if (tailBudgetMs > 0 && peersBusy != null) {
+                if (peersBusy.getAsBoolean() || gotNote) {
+                    // 还有队友在跑，或刚收到外部输入 —— 这都不是尾巴，重新起算
+                    tailDeadlineMs = 0;
+                    tailReminderSent = false;
+                } else if (tailDeadlineMs == 0) {
+                    tailDeadlineMs = System.currentTimeMillis() + tailBudgetMs;
+                } else if (System.currentTimeMillis() > tailDeadlineMs) {
+                    if (tailReminderSent) {
+                        putSafe(queue, new AgentEvent.LoopComplete(iteration));
+                        loopCompleted = true;
+                        break;
+                    }
+                    tailReminderSent = true;
+                    conv.addSystemReminder(TAIL_BUDGET_REMINDER);
                 }
             }
 
@@ -477,6 +561,21 @@ public class Agent {
 
             // No tool calls → done
             if (toolCalls.isEmpty()) {
+                // 队友还在干活时，这一轮不算「干完了」：等消息，等到了就接着跑。
+                // 收工判据原先只有「本轮没有工具调用」一条，而 lead 的「没有动作」有两种
+                // 含义 —— 活儿干完了，和正等队友。详见 awaitBusyPeers。
+                if (awaitBusyPeers(conv, token)) {
+                    // 队友消息 = 外部输入进来了：进度审查的预算整档重新起算，
+                    // 否则「等队友 → 收汇报 → 接着干」这段会被算成同一个自转周期，
+                    // 一档预算撞两次「缺乏方向」就把还在收敛的任务取消了。
+                    if (progressReviewer != null) progressReviewer.reset(iteration);
+                    continue;
+                }
+                // 等待期间被取消/中断：别把一次取消记成 SUCCEEDED
+                if (token.isCancelled() || Thread.currentThread().isInterrupted()) {
+                    cancelled = true;
+                    break;
+                }
                 if (fileHistory != null) {
                     String summary = text.length() > 60 ? text.substring(0, 60) + "..." : text.toString();
                     fileHistory.makeSnapshot(conv.size(), summary);
@@ -492,7 +591,9 @@ public class Agent {
             }
 
             // Execute tool calls
-            var executor = new StreamingExecutor(registry, checker, hookEngine, queue, recoveryState, token, reportService);
+            // 把上面的 toolNameFilter 一并交给执行侧：那一份判定已经在 :239 裁过 schema，
+            // 这里再拦一次执行，两侧才真正一致（否则限制只是「藏起来」，不是「拦住」）。
+            var executor = new StreamingExecutor(registry, checker, hookEngine, queue, recoveryState, token, reportService, toolNameFilter);
             var callInfos = toolCalls.stream()
                     .map(tc -> new StreamingExecutor.ToolCallInfo(tc.toolId, tc.toolName, tc.args))
                     .toList();
@@ -504,21 +605,20 @@ public class Agent {
                     .toList();
             conv.addToolResultsMessage(resultBlocks);
 
-            // ── 循环看门狗：喂本轮"动作签名 + 是否有产出"，由软到硬介入 ──
+            // ── 循环看门狗：喂本轮"动作签名"，由软到硬介入 ──
+            // 签名尾部带上成功/失败位，判据才是「同样的调用拿到同样的结果」。少了这一位，
+            // 一条偶发失败的命令被原样重跑三次也会算连续重复（参数一字不差）—— 而重跑
+            // flaky 命令是合理行为，那是误报。取结果的状态而非结果正文：正文带耗时、
+            // 行数这类每轮都变的字段，纳进来会把真重复打散。
+            var failedByToolId = new HashMap<String, Boolean>();
+            for (var r : results) failedByToolId.put(r.toolId(), r.isError());
             var sigNames = new ArrayList<String>();
-            for (var tc : toolCalls) sigNames.add(tc.toolName() + "(" + tc.args() + ")");
-            Collections.sort(sigNames);
-            boolean productive = false;
-            for (var r : results) {
-                if (r.isError()) continue;
-                for (var tc : toolCalls) {
-                    if (!tc.toolId().equals(r.toolId())) continue;
-                    var t = registry.get(tc.toolName());
-                    if (t != null && t.category() != ToolCategory.READ) { productive = true; break; }
-                }
-                if (productive) break;
+            for (var tc : toolCalls) {
+                boolean failed = Boolean.TRUE.equals(failedByToolId.get(tc.toolId()));
+                sigNames.add(tc.toolName() + "(" + tc.args() + ")[" + (failed ? "F" : "S") + "]");
             }
-            var verdict = watchdog.onTurn(iteration, String.join(" | ", sigNames), productive);
+            Collections.sort(sigNames);
+            var verdict = watchdog.onTurn(iteration, String.join(" | ", sigNames));
             switch (verdict.action()) {
                 case NUDGE, ESCALATE -> {
                     conv.addSystemReminder(verdict.message());
@@ -602,6 +702,54 @@ public class Agent {
     }
 
     private String lastStreamError;
+
+    /**
+     * 队友还在跑某一轮时，把这一轮「没有工具调用」的收工判据压住，改为等消息。
+     *
+     * <p><b>这条守的是一个实测形态，不是假想：</b>2026-09-25 的 team 实跑里，lead 派完活
+     * 就以 {@code SUCCEEDED} 收尾，终版报告写「本次任务共执行两项动作，均为 SendMessage
+     * 消息发送……无文件改动记录」—— 而那一刻两个队友正在写文件。bench 也照着这条终态
+     * 把「交付完成」判早了。根因就是收工只看「本轮有没有工具调用」：lead 的「没有动作」
+     * 既可能是活儿干完了，也可能是正在等队友，而这两件事在事件流上一模一样。
+     *
+     * <p><b>为什么判据是「队友正在跑一轮」而不是「队友线程还活着」：</b>队友干完一轮会
+     * 阻塞在 {@code waitForNextPromptOrShutdown} 等消息 —— 线程活着（{@code Member.active}
+     * 为 true），但没在干活。若按后者判，lead 会在每个团队任务的尾巴上白等满
+     * {@link #peerWaitMs}。空闲队友必然已经（或即将）往 lead 邮箱投一条通知，那条消息
+     * 由既有的 mailbox 轮询唤醒 lead，不需要这里兜。
+     *
+     * <p>等待期间纯空转：每 {@link #PEER_POLL_MS} 排空一次邮箱，不产生 API 调用，
+     * 所以「等」本身不烧钱；上限 {@link #peerWaitMs} 保证不会无限期挂着。
+     *
+     * @return true 表示已把新消息注入 {@code conv}，调用方应继续下一轮而不是收工
+     */
+    private boolean awaitBusyPeers(ConversationManager conv, CancellationToken token) {
+        if (peersBusy == null || !peersBusy.getAsBoolean()) return false;
+
+        long deadline = System.currentTimeMillis() + peerWaitMs;
+        while (System.currentTimeMillis() < deadline) {
+            if (token.isCancelled() || Thread.currentThread().isInterrupted()) return false;
+
+            // 有消息就立刻接着跑一轮 —— 这正是「队友报完工，lead 收尾」该走的路
+            if (notificationFn != null) {
+                var notes = notificationFn.get();
+                if (!notes.isEmpty()) {
+                    for (String note : notes) conv.addSystemReminder(note);
+                    return true;
+                }
+            }
+
+            if (!peersBusy.getAsBoolean()) return false;   // 队友都收工了：这才是真终态
+
+            try {
+                Thread.sleep(PEER_POLL_MS);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                return false;
+            }
+        }
+        return false;
+    }
 
     private String events_drain_last_error(BlockingQueue<AgentEvent> queue) {
         return lastStreamError;

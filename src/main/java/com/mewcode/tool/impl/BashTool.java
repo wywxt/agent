@@ -126,6 +126,7 @@ public class BashTool implements Tool {
             timeout = MAX_TIMEOUT;
         }
 
+        java.nio.file.Path script = null;
         try {
             // 如果沙箱可用，将命令包装在沙箱中执行
             String actualCommand = command;
@@ -133,7 +134,11 @@ public class BashTool implements Tool {
                 actualCommand = sandbox.wrap(command, sandboxConfig);
             }
 
-            ProcessBuilder pb = new ProcessBuilder(withShellPrefix(actualCommand));
+            // 命令落到临时脚本再执行，不走命令行参数（详见 shellCommand 的说明）。
+            script = writeCommandScript(actualCommand);
+            ProcessBuilder pb = new ProcessBuilder(
+                    script != null ? scriptArgv(script) : withShellPrefix(actualCommand));
+
             // 合并 stdout 和 stderr 到同一个流，简化输出解析
             pb.redirectErrorStream(true);
 
@@ -197,7 +202,59 @@ public class BashTool implements Tool {
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt();
             return ToolResult.error("Error: command interrupted");
+        } finally {
+            if (script != null) {
+                try {
+                    java.nio.file.Files.deleteIfExists(script);
+                } catch (IOException ignored) {
+                    // 临时文件删不掉不影响命令结果，留给系统清理
+                }
+            }
         }
+    }
+
+    /**
+     * 把命令写成临时脚本，返回脚本路径；失败返回 null（调用方退回命令行方式）。
+     *
+     * <p><b>为什么不能直接把命令当 {@code -c} 的参数：</b>Windows 上这条路会**静默地吃掉
+     * 命令里的双引号**。{@code ProcessBuilder} 把 argv 重新拼成命令行时按 MSVC 规则转义，
+     * 而 Git Bash 的 msys 运行时按自己的一套解析 —— 两边不兼容，命令被拆坏却依然退出码 0，
+     * 所以调用方完全看不出异常。2026-09-25 的 team 实跑里，lead 因此在「这个 shell 会吞引号」
+     * 上烧掉好几轮，队友则改用 {@code printf '\042'} 这类八进制转义绕坑。
+     *
+     * <p>实测（同机同 JDK 同 bash，{@code ProcessBuilder(bash, "-c", cmd)}）：
+     * <pre>
+     * echo "hello world"; echo 'single quoted ok'  →  hello          （应为 hello world / single quoted ok）
+     * echo "=== root ==="                            →  ===            （应为 === root ===）
+     * netstat -ano | grep -E "3000|8080|9222"        →  bash: 8080: command not found（引号内的 | 被当成了管道）
+     * </pre>
+     * 改成「写文件 + {@code bash <file>}」后三条全部正确 —— 路径里没有引号，不经过那一层解析。
+     *
+     * <p>临时文件建在系统临时目录（不污染 workDir），{@code execute} 结束时删除。
+     */
+    private static java.nio.file.Path writeCommandScript(String command) {
+        boolean cmdShell = isCmdExe();
+        String suffix = cmdShell ? ".cmd" : ".sh";
+        try {
+            java.nio.file.Path f = java.nio.file.Files.createTempFile("mewcode-cmd", suffix);
+            java.nio.file.Files.writeString(f, command, java.nio.charset.StandardCharsets.UTF_8);
+            return f;
+        } catch (IOException e) {
+            return null;
+        }
+    }
+
+    /** {shell, 脚本路径}；bash 用正斜杠路径，cmd.exe 用原生路径。 */
+    private static String[] scriptArgv(java.nio.file.Path script) {
+        String path = script.toString();
+        if (!isCmdExe()) {
+            path = path.replace('\\', '/');
+        }
+        return new String[]{shellPrefix()[0], path};
+    }
+
+    private static boolean isCmdExe() {
+        return shellPrefix()[0].toLowerCase().endsWith("cmd.exe");
     }
 
     /** 把命令包装成 {shell, "-c"|"/c", command} 形式。 */
