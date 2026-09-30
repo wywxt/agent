@@ -127,18 +127,46 @@ public final class ReportService {
 
     public enum ProgressStatus { PROGRESSING, WANDERING, STUCK }
 
-    public record ProgressVerdict(ProgressStatus status, String summary) {}
+    /**
+     * 一次进度审查的结论。
+     *
+     * <p>{@code score} 是相对目标的完成度（0~1），缺了它就看不出**趋势**：
+     * 0.3 → 0.5 → 0.7 说明仍在推进（只是慢），0.6 → 0.6 才是真的原地打转。
+     * 只给一个孤立的三态，这两种情况区分不出来，而它们的处置正好相反。</p>
+     *
+     * <p>{@code missing} 是「离目标还差什么」—— 有了它，结论才能变成下一轮的指令，
+     * 而不是一句泛泛的「你缺乏方向」。</p>
+     */
+    public record ProgressVerdict(ProgressStatus status, String summary, double score, String missing) {
+
+        /** 分数未知：模型没输出 SCORE，或值不在 [0,1]。 */
+        public static final double SCORE_UNKNOWN = -1;
+
+        /** 兼容三态构造：旧调用方 / 模型只回了 STATUS+SUMMARY 时用。 */
+        public ProgressVerdict(ProgressStatus status, String summary) {
+            this(status, summary, SCORE_UNKNOWN, "");
+        }
+    }
 
     /**
      * 审查主 Agent 是否在有效推进，还是缺乏方向地在绕圈（软空转）。
      * 供循环看门狗第二层在轮次超预算时调用。模型不可用/超时/无事件时返回 null。
+     *
+     * @param objective 任务的原始目标。审查员要判断的是「有没有朝目标推进」，
+     *                  没有目标它只能靠工具名的表面条理去猜；null 时按「未提供」降级。
+     * @param eventWindow 审查窗口（取最近多少条事件）。要覆盖「上一次审查到现在」这一段，
+     *                    否则审查员看到的是一堆碎片截面，会系统性放大「没方向」的错觉。
+     *                    条数由调用方按自己的审查间隔算（见 {@code ProgressReviewer}）。
      */
-    public ProgressVerdict assessProgress(String taskId, int iteration) {
+    public ProgressVerdict assessProgress(String taskId, int iteration,
+                                          String objective, int eventWindow) {
         if (model == null) return null;
         var events = store.readByTask(taskId);
         if (events.isEmpty()) return null;
-        int from = Math.max(0, events.size() - 40);
-        String out = complete(assessPrompt(iteration, events.subList(from, events.size())), DEFAULT_TIMEOUT_MS);
+        int from = Math.max(0, events.size() - Math.max(1, eventWindow));
+        String out = complete(
+                assessPrompt(iteration, events.subList(from, events.size()), objective),
+                DEFAULT_TIMEOUT_MS);
         return out == null ? null : parseProgressVerdict(out);
     }
 
@@ -356,65 +384,204 @@ public final class ReportService {
                 """.formatted(renderEvents(events), question);
     }
 
-    private static ProgressVerdict parseProgressVerdict(String out) {
+    static ProgressVerdict parseProgressVerdict(String out) {
         ProgressStatus status = null;
         String summary = "";
+        double score = ProgressVerdict.SCORE_UNKNOWN;
+        String missing = "";
         for (String line : out.split("\\R")) {
             String s = line.strip();
             if (s.startsWith("STATUS:")) {
                 status = parseStatus(s.substring("STATUS:".length()).strip());
             } else if (s.startsWith("SUMMARY:")) {
                 summary = s.substring("SUMMARY:".length()).strip();
+            } else if (s.startsWith("SCORE:")) {
+                score = parseScore(s.substring("SCORE:".length()).strip());
+            } else if (s.startsWith("MISSING:")) {
+                missing = s.substring("MISSING:".length()).strip();
             }
         }
         if (status == null) return null;
-        return new ProgressVerdict(status, summary);
+        return new ProgressVerdict(status, summary, score, missing);
     }
 
-    private static ProgressStatus parseStatus(String s) {
-        String u = s.toUpperCase();
-        if (u.contains("WANDERING")) return ProgressStatus.WANDERING;
-        if (u.contains("STUCK")) return ProgressStatus.STUCK;
-        if (u.contains("PROGRESSING")) return ProgressStatus.PROGRESSING;
-        return null;
+    /**
+     * 解析 0~1 的分数。认不出来一律记为 {@link ProgressVerdict#SCORE_UNKNOWN}。
+     *
+     * <p>分数只服务于「趋势」判断，缺了不影响 STATUS 的判定 ——
+     * 所以这里宁可返回未知，也不猜一个值出来。</p>
+     *
+     * <p>模型可能写成 {@code SCORE: 0.7} / {@code SCORE: 0.7（约七成）} / {@code SCORE: 70%}，
+     * 所以只取第一个数字，并做 0~1 的范围校验。</p>
+     */
+    private static double parseScore(String s) {
+        var m = java.util.regex.Pattern.compile("(\\d+(?:\\.\\d+)?)").matcher(s);
+        if (!m.find()) return ProgressVerdict.SCORE_UNKNOWN;
+        try {
+            double v = Double.parseDouble(m.group(1));
+            return (v >= 0 && v <= 1) ? v : ProgressVerdict.SCORE_UNKNOWN;
+        } catch (NumberFormatException e) {
+            return ProgressVerdict.SCORE_UNKNOWN;
+        }
     }
 
-    private static String assessPrompt(int iteration, List<EventEnvelope> events) {
+    /**
+     * 只取首个词做精确匹配。包可见，便于测试。
+     *
+     * <p><b>为什么不能用 contains：</b>模型会用自然语言补充说明。它写
+     * {@code STATUS: 并非 STUCK，仍在进展} 时，{@code contains("STUCK")} 会命中，
+     * 把「明确说了不是卡住」读成「卡住」；而 STUCK 经
+     * {@code ProgressReviewer.applyVerdict} 连续两次就直接 CANCEL。
+     * 这是最不该存在的误杀路径：模型说没卡，系统读成卡了，然后终止任务。
+     * 同理 {@code NOT WANDERING} 会被读成 WANDERING。</p>
+     *
+     * <p><b>为什么认不出来要返回 null：</b>解析失败必须降级为「不介入」，
+     * 绝不能降级为「介入」。null 传到 {@code ProgressReviewer.applyVerdict}
+     * 会变成 {@code Verdict.NONE}，任务照常跑 —— 这是安全的失败方向。</p>
+     */
+    static ProgressStatus parseStatus(String s) {
+        if (s == null) return null;
+        // 按首个非字母字符切开，只看第一个词；模型补充的说明（中文/括号/标点）
+        // 一律不进判定。首词不是三个状态之一就返回 null。
+        String first = s.strip().toUpperCase().split("[^A-Z]", 2)[0];
+        return switch (first) {
+            case "PROGRESSING" -> ProgressStatus.PROGRESSING;
+            case "WANDERING" -> ProgressStatus.WANDERING;
+            case "STUCK" -> ProgressStatus.STUCK;
+            default -> null;
+        };
+    }
+
+    /**
+     * 进度审查 prompt。三处措辞是刻意的，改动前请先看 {@code 循环检测优化设计.md} 的 C1/C3/C4：
+     *
+     * <ul>
+     *   <li><b>给了目标</b>：审查员判断的是「有没有朝目标推进」，而方向是相对目标而言的。
+     *       原版没有任何目标，它只能靠工具名的表面条理去猜，这是判断不准的根本原因。</li>
+     *   <li><b>去掉了诱导</b>：原版开头写「已运行 %d 轮，远超常规任务规模，疑似进展过慢或缺乏方向」——
+     *       而它只在超预算后才会被调用，等于每次调用都先告诉它「这很可能有问题」，
+     *       偏置方向正好指向 CANCEL。</li>
+     *   <li><b>分开「慢」和「卡」</b>：任务规模大就会轮次多，轮次数本身不是判据。</li>
+     * </ul>
+     */
+    private static String assessPrompt(int iteration, List<EventEnvelope> events, String objective) {
+        String goal = (objective == null || objective.isBlank())
+                ? "（未提供 —— 只能依据事件时间线自身的连贯性判断）"
+                : truncate(objective.strip(), 2_000);
         return """
-                你是编码 Agent 的进度审查员。主 Agent 已运行 %d 轮，远超常规任务规模，
-                疑似进展过慢或缺乏方向。以下是它最近的工具执行事实（已脱敏）。
-                判断它的状态：
-                  PROGRESSING —— 仍在有效推进、方向明确
-                  WANDERING   —— 有产出但缺乏方向、在绕圈、目标不清
-                  STUCK       —— 基本卡住、重复或停滞
+                你是编码 Agent 的进度审查员。主 Agent 已完成 %d 轮，请判断它相对任务目标的推进情况。
 
-                只输出两行，不要其他内容：
-                第一行：STATUS: PROGRESSING|WANDERING|STUCK
-                第二行：SUMMARY: 一句话中文说明（它在干嘛、卡在哪、是否该收尾）
+                <objective>
+                %s
+                </objective>
+
+                先列出该目标隐含的、可核查的具体要求（3~7 条），再逐条到下面的事件时间线里找证据。
+                只有时间线里看得到的证据才算数；没体现的要求明确记为"未验证"。最后才下结论。
+
+                判据是"相对目标有没有推进"，不是轮次多少：
+                  PROGRESSING —— 每轮都在朝目标靠近（哪怕慢，哪怕这是要改 20 个文件的大任务）
+                  WANDERING   —— 有产出但在绕圈：反复试探、来回改同一处、目标漂移
+                  STUCK       —— 基本停滞：重复同样的动作，或反复撞同一个错误且没有新信息
+                轮次数多本身不算问题 —— 任务规模大就会轮次多，只有"没有净推进"才算卡。
+
+                拿不准时判 PROGRESSING。你的结论会直接导致任务被终止，
+                误判 STUCK 的代价（终止一个正在收敛的任务）远高于漏判的代价。
+
+                只输出四行，不要其他内容：
+                STATUS: PROGRESSING|WANDERING|STUCK
+                SCORE: 0 到 1 之间的一个数，表示相对目标的完成度（只看证据，不猜）
+                MISSING: 离目标还差什么，分号分隔（没有就留空）
+                SUMMARY: 一句话中文说明（它在干嘛、卡在哪、是否该收尾）
 
                 事件时间线：
                 %s
-                """.formatted(iteration, renderEvents(events));
+                """.formatted(iteration, goal, renderEvents(events));
     }
 
-    /** 将事件序列化为脱敏文本行（截断超长输出）。 */
-    private static String renderEvents(List<EventEnvelope> events) {
-        var sb = new StringBuilder();
+    /**
+     * 将事件序列化为脱敏文本行（截断超长输出）。包可见，便于测试。
+     *
+     * <p><b>为什么要把 output / args 也渲染出来：</b>这些数据本来就在事件里
+     * （{@code EventBridge.toolFinished} 的 {@code output}、{@code toolProposed}
+     * 的 {@code args}），只是渲染时被丢掉了。而读这份时间线的是「进度审查员」，
+     * 它要判断的正是「有没有朝目标推进」—— 只给它「完成 ReadFile [成功] 0.02s」，
+     * 它看不到改了哪个文件、测试报了什么错，判断只能靠工具名的表面条理去猜。
+     * 数据在手上却扔掉，是这一层判断不准的直接原因之一。</p>
+     *
+     * <p>每条截断 300 字符：窗口放大后（见 C7）prompt 体积的主要成本在这里。</p>
+     */
+    static String renderEvents(List<EventEnvelope> events) {
+        var lines = new ArrayList<String>(events.size());
         for (var e : events) {
             var p = e.payload();
             String line = switch (e.type()) {
-                case TOOL_PROPOSED -> "准备调用 " + p.get("toolName");
+                case TOOL_PROPOSED -> "准备调用 " + p.get("toolName")
+                        + " 参数 " + truncate(safeString(asArgs(p.get("args"))), 300);
                 case TOOL_STARTED -> "开始执行 " + p.get("toolName");
                 case TOOL_FINISHED -> "完成 " + p.get("toolName")
                         + (Boolean.TRUE.equals(p.get("isError")) ? " [失败]" : " [成功]")
-                        + " 耗时 " + p.get("elapsed") + "s";
-                case APPROVAL_WAITING -> "等待审批 " + p.get("toolName");
+                        + " 耗时 " + p.get("elapsed") + "s"
+                        + "\n    输出：" + truncate(asText(p.get("output")), 300);
+                // payload 的 key 是 description，不是 toolName —— 读错会渲染成「等待审批 null」
+                case APPROVAL_WAITING -> "等待审批 " + p.get("description");
                 case DIRECTIVE_STATUS -> "指令状态 " + p.get("status");
                 case TASK_TERMINAL -> "任务终态 " + p.get("status");
             };
-            sb.append("- ").append(line).append("\n");
+            lines.add("- " + line + "\n");
         }
-        return sb.toString();
+        return joinWithinBudget(lines);
+    }
+
+    /** 时间线总预算（字符）。 */
+    private static final int RENDER_TOTAL_BUDGET = 60_000;
+
+    /**
+     * 拼接时间线，超预算时保留首尾、省略中段。
+     *
+     * <p><b>为什么必须有总预算：</b>带每行 300 字符的输出后，单行从约 40 字符涨到约 330 字符。
+     * 进度审查和进度报告只取最近 40 条（有界），但最终报告和问答 {@code answerQuestion}
+     * 会喂**整个任务事件流** —— 长任务上千条事件时，prompt 会比改动前放大近 10 倍，
+     * 直接撞上下文上限。所以按总字符数封顶。</p>
+     *
+     * <p><b>为什么省略中段而不是丢掉尾部：</b>首段是任务怎么起头的（目标、涉及哪些文件），
+     * 尾段是结论和最后一次测试结果 —— 报告和审查员主要靠这两头；中段是最密集的重复调用，
+     * 信息增量最低。省略中段比丢尾部损失小。</p>
+     */
+    private static String joinWithinBudget(List<String> lines) {
+        int total = 0;
+        for (String l : lines) total += l.length();
+        if (total <= RENDER_TOTAL_BUDGET) return String.join("", lines);
+
+        int half = RENDER_TOTAL_BUDGET / 2;
+        var head = new ArrayList<String>();
+        var tail = new ArrayList<String>();
+        int used = 0;
+        for (String l : lines) {
+            if (used + l.length() > half) break;
+            head.add(l);
+            used += l.length();
+        }
+        used = 0;
+        for (int i = lines.size() - 1; i >= 0; i--) {
+            String l = lines.get(i);
+            if (used + l.length() > half) break;
+            tail.add(0, l);
+            used += l.length();
+        }
+        head.add("- ...（中间省略 " + (lines.size() - head.size() - tail.size())
+                + " 条事件，控制 prompt 体积）\n");
+        head.addAll(tail);
+        return String.join("", head);
+    }
+
+    /** 事件 payload 里的 args 声明为 Object，取出为 Map 再序列化。 */
+    @SuppressWarnings("unchecked")
+    private static Map<String, Object> asArgs(Object o) {
+        return o instanceof Map<?, ?> m ? (Map<String, Object>) m : null;
+    }
+
+    private static String asText(Object o) {
+        return o == null ? "" : String.valueOf(o);
     }
 
     private static String truncate(String s, int max) {

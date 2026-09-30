@@ -25,6 +25,8 @@ import java.util.Map;
 import java.util.concurrent.BlockingQueue;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.Executors;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.TimeoutException;
 
 /**
  * Concurrent tool executor that partitions tool calls into read-only (parallel)
@@ -40,6 +42,20 @@ public class StreamingExecutor {
     private final RecoveryState recoveryState;
     private final CancellationToken token;
     private final ReportService reportService;
+
+    /**
+     * 执行期工具闸门，与 {@link Agent#setToolNameFilter} 是同一份判定，只是那个用在
+     * schema 侧、这个用在执行侧。null 表示不限制。
+     */
+    private final java.util.function.Predicate<String> toolGate;
+
+    /**
+     * 等待用户审批的上限，超过即按拒绝处理。
+     *
+     * <p>取 5 分钟与审批自身的 TTL（{@code ApprovalService.DEFAULT_TTL_MS}）一致：
+     * 超过这个时间，前端的补答也已被判过期，再等下去没有意义。
+     */
+    private static final long APPROVAL_WAIT_MS = 5 * 60 * 1000L;
 
     public record ToolCallInfo(String toolId, String toolName, Map<String, Object> args) {}
     public record ToolExecResult(String toolId, String output, boolean isError) {}
@@ -65,6 +81,22 @@ public class StreamingExecutor {
                              HookEngine hookEngine, BlockingQueue<AgentEvent> eventQueue,
                              RecoveryState recoveryState, CancellationToken token,
                              ReportService reportService) {
+        this(registry, checker, hookEngine, eventQueue, recoveryState, token, reportService, null);
+    }
+
+    /**
+     * @param toolGate 执行期工具闸门，与 {@code Agent.toolNameFilter} 是同一份判定。
+     *
+     * <p>Agent 每轮迭代只用那个 filter 裁掉**发给模型的 schema**；模型若凭记忆硬吐出
+     * 一个已被裁掉的名字，执行侧原本 {@code registry.get()} 拿到就照跑不误 —— 于是
+     * 「计划阶段不许动手」之类的限制永远只是提示词层面的君子协定。这道闸门补上执行
+     * 侧的那一半，让同一个判定在两侧都生效。null 表示不限制（默认，保持既有行为）。
+     */
+    public StreamingExecutor(ToolRegistry registry, PermissionChecker checker,
+                             HookEngine hookEngine, BlockingQueue<AgentEvent> eventQueue,
+                             RecoveryState recoveryState, CancellationToken token,
+                             ReportService reportService,
+                             java.util.function.Predicate<String> toolGate) {
         this.registry = registry;
         this.checker = checker;
         this.hookEngine = hookEngine;
@@ -72,6 +104,7 @@ public class StreamingExecutor {
         this.recoveryState = recoveryState;
         this.token = token;
         this.reportService = reportService;
+        this.toolGate = toolGate;
     }
 
     public List<ToolExecResult> executeAll(List<ToolCallInfo> calls) {
@@ -153,6 +186,15 @@ public class StreamingExecutor {
             return new ToolExecResult(call.toolId(), "Error: unknown tool '" + call.toolName() + "'", true);
         }
 
+        // 闸门放在 registry.get 之后：工具确实存在、只是当前阶段不让用，报错文案要说清
+        // 这个区别 —— 「未知工具」会让模型去 ToolSearch 找一个它其实不该用的工具。
+        if (toolGate != null && !toolGate.test(call.toolName())) {
+            String msg = "Error: tool '" + call.toolName()
+                    + "' is not available in the current phase. Do not retry it.";
+            putSafe(new AgentEvent.ToolResultEvent(call.toolId(), call.toolName(), msg, true, 0));
+            return new ToolExecResult(call.toolId(), msg, true);
+        }
+
         // 权限检查优先于 hook（与 Go 版保持一致）：先拦截无权操作，再让 hook 介入
         if (checker != null) {
             var check = checker.check(tool, call.args());
@@ -175,9 +217,20 @@ public class StreamingExecutor {
                             checker.policyVersion(), desc, explanation, future));
                     PermissionResponse response;
                     try {
-                        // 阻塞等待用户批准，不设超时：用户可能长时间离开，超时会把一次
-                        // 未及时批准的调用误判为「拒绝」，一直阻塞反而更符合预期。
-                        response = future.get();
+                        // 等待用户批准，有上限。原先是不设超时的阻塞，理由写的是「用户
+                        // 可能长时间离开，超时会把未及时批准误判为拒绝」。实测下来这更
+                        // 糟：客户端断线后没有任何路径能完成这个 future（pendingPerms
+                        // 只在这里存、在 RemoteServer.handlePermissionResponse 里取，
+                        // 没有扫描也没有清理），整个任务就永久卡死 —— 一次未及时批准的
+                        // 代价从「慢一点」变成「永远不动」。上轮 lead 被卡 4 分钟即由此
+                        // 而来，且那 4 分钟会被算进实验耗时。
+                        response = future.get(APPROVAL_WAIT_MS, TimeUnit.MILLISECONDS);
+                    } catch (TimeoutException e) {
+                        putSafe(new AgentEvent.ToolResultEvent(
+                                call.toolId(), call.toolName(),
+                                "No approval response within " + (APPROVAL_WAIT_MS / 60_000)
+                                        + " min; treated as denied", true, 0));
+                        response = PermissionResponse.DENY;
                     } catch (InterruptedException e) {
                         Thread.currentThread().interrupt();
                         response = PermissionResponse.DENY;
@@ -213,7 +266,7 @@ public class StreamingExecutor {
         long start = System.nanoTime();
         ToolResult result;
         try {
-            putSafe(new AgentEvent.ToolStartEvent(call.toolId(), call.toolName()));
+            putSafe(new AgentEvent.ToolStartEvent(call.toolId(), call.toolName(), call.args()));
             result = tool.execute(call.args());
         } catch (Exception e) {
             result = ToolResult.error("Tool execution error: " + e.getMessage());

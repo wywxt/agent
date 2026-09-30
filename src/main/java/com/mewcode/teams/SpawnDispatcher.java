@@ -19,13 +19,21 @@ public final class SpawnDispatcher {
     public record SpawnConfig(
             TeamManager.Team team,
             String memberName,
+            String role,
             String task,
             String addendum,
             LlmClient client,
             ToolRegistry registry,
             String protocol,
             com.mewcode.config.ProviderConfig providerConfig,
-            String workdir
+            String workdir,
+            /**
+             * 队友事件的出口（可为 null）。
+             *
+             * <p>由 lead 侧从 {@code TeamManager.getTeammateEventSink()} 取出后传入 ——
+             * 队友自己够不到 lead 的事件队列，必须在这里显式带进来。
+             */
+            java.util.concurrent.BlockingQueue<com.mewcode.agent.AgentEvent> eventSink
     ) {}
 
     public record SpawnResult(
@@ -41,14 +49,15 @@ public final class SpawnDispatcher {
 
         switch (mode) {
             case IN_PROCESS -> {
-                var member = team.addMember(config.memberName(), config.client(),
+                var member = team.addMember(config.memberName(), config.role(), config.client(),
                         config.registry(), config.protocol(), config.providerConfig());
                 if (config.workdir() != null) {
                     member.agent.setWorkDir(config.workdir());
                 }
                 member.active = true;
                 member.thread = Thread.startVirtualThread(() ->
-                        TeammateRunner.runInProcessTeammate(team, member, config.task(), config.addendum()));
+                        TeammateRunner.runInProcessTeammate(team, member, config.task(), config.addendum(),
+                                config.eventSink()));
                 return new SpawnResult(mode, null);
             }
             case TMUX -> {
@@ -58,7 +67,7 @@ public final class SpawnDispatcher {
                 }
                 String cliCommand = buildTeammateCLI(team.getName(), config.memberName(), config.workdir());
                 String paneId = TmuxBackend.spawnTmuxTeammate(team.getName(), config.memberName(), cliCommand);
-                recordExternalMember(team, config.memberName(), paneId);
+                recordExternalMember(team, config.memberName(), config.role(), paneId);
                 return new SpawnResult(mode, paneId);
             }
             case ITERM -> {
@@ -68,7 +77,7 @@ public final class SpawnDispatcher {
                 }
                 String itermCmd = buildTeammateCLI(team.getName(), config.memberName(), config.workdir());
                 String tabId = ITermBackend.spawnITermTeammate(team.getName(), config.memberName(), itermCmd);
-                recordExternalMember(team, config.memberName(), tabId);
+                recordExternalMember(team, config.memberName(), config.role(), tabId);
                 return new SpawnResult(mode, tabId);
             }
             default -> throw new IllegalStateException("Unsupported team mode: " + mode);
@@ -92,9 +101,9 @@ public final class SpawnDispatcher {
         return "'" + s.replace("'", "'\\''") + "'";
     }
 
-    private static void recordExternalMember(TeamManager.Team team, String name, String paneId) {
+    private static void recordExternalMember(TeamManager.Team team, String name, String role, String paneId) {
         // For external backends, create a placeholder member
-        var member = new TeamManager.Member(name, null, null);
+        var member = new TeamManager.Member(name, role, null, null);
         member.active = true;
         // Store paneId via field access (simple approach)
         synchronized (team) {

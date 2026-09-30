@@ -72,6 +72,31 @@ public class ConversationManager {
         return List.copyOf(history);
     }
 
+    /**
+     * 任务的原始目标：第一条 role="user"、content 非空、且不是 system-reminder 包装块的消息。
+     *
+     * <p>供进度审查使用 —— 审查员要判断「有没有方向」，而方向是相对目标而言的。
+     * 不给它目标，它只能靠工具名的表面条理去猜。</p>
+     *
+     * <p><b>不能直接取「第一条 user 消息」</b>，本类里就有三个坑：
+     * {@link #injectLongTermMemory} 在 index 0 插入的 &lt;system-reminder&gt; 块 role 也是 user；
+     * {@link #addSystemReminder} 注入的提醒同样是 user；
+     * {@link #addToolResultsMessage} 产生的工具结果消息也是 user 且 content 为空。
+     * 三者都会把真正的用户诉求挤到后面。</p>
+     *
+     * @return 原始目标；都没有则返回 null（此时调用方按「无目标」降级）
+     */
+    public String firstUserRequest() {
+        for (Message m : history) {
+            if (!"user".equals(m.getRole())) continue;
+            String c = m.getContent();
+            if (c == null || c.isBlank()) continue;
+            if (c.stripLeading().startsWith("<system-reminder>")) continue;
+            return c;
+        }
+        return null;
+    }
+
     public List<Message> getMessagesMutable() {
         return history;
     }

@@ -81,7 +81,11 @@ public class RemoteServer {
 
     // ── Agent 核心组件 ────────────────────────────────────────────────
     private Agent agent;
-    private ConversationManager conversation;
+    /**
+     * volatile：/clear 与 /resume 会在 WS 线程上整体替换这个引用，且它们不持有
+     * taskStartLock，与轮询线程之间没有 happens-before 边。
+     */
+    private volatile ConversationManager conversation;
     private ToolRegistry registry;
     private LlmClient client;
     private String sessionId;
@@ -91,8 +95,16 @@ public class RemoteServer {
     // ── 流式状态 ──────────────────────────────────────────────────────
     private volatile boolean streaming;
     private BlockingQueue<AgentEvent> agentQueue;
+    /** 队友事件的独立通道，见 {@link #drainTeammateEvents}。 */
+    private volatile BlockingQueue<AgentEvent> teammateQueue;
     private final AtomicReference<TaskExecutionHandle> activeTask = new AtomicReference<>();
     private final ReentrantLock taskStartLock = new ReentrantLock();
+
+    // ── 团队邮箱轮询 ──────────────────────────────────────────────────
+    private ScheduledExecutorService mailboxPoller;
+
+    /** 邮箱轮询间隔，与 TUI 的 MailboxPollMessage 对齐（tui/MewCodeModel.java:389）。 */
+    private static final long MAILBOX_POLL_INTERVAL_MS = 2000;
     private DirectiveService directiveService;
     private EventBridge eventBridge;
     private EventStore eventStore;
@@ -122,15 +134,20 @@ public class RemoteServer {
     private volatile String mcpInstructions = "";
     private final boolean enableCoordinatorMode;
 
+    /** 权限模式，来自配置的 {@code permission_mode}。
+     *  initAgent 里原先硬编码 {@code DEFAULT}，于是配置写 {@code BYPASS} 也不生效。 */
+    private final PermissionMode permissionMode;
+
     public RemoteServer(List<ProviderConfig> providers, List<McpServerConfig> mcpConfigs,
                         List<HookConfig> hookConfigs, String addr, boolean enableCoordinatorMode,
-                        ProviderConfig reportProvider) {
+                        ProviderConfig reportProvider, PermissionMode permissionMode) {
         this.providers = providers;
         this.mcpConfigs = mcpConfigs;
         this.hookConfigs = hookConfigs;
         this.addr = addr;
         this.enableCoordinatorMode = enableCoordinatorMode;
         this.reportProvider = reportProvider;
+        this.permissionMode = permissionMode != null ? permissionMode : PermissionMode.DEFAULT;
     }
 
     /**
@@ -174,6 +191,9 @@ public class RemoteServer {
                 .start("0.0.0.0", port);
 
         System.out.printf("%n  Remote UI: http://localhost:%d%n%n", port);
+
+        // 团队邮箱轮询：队友的汇报需要能唤醒 lead（无 team 时零开销）
+        startMailboxPoller();
 
         // 阻塞主线程，让服务器持续运行
         Thread.currentThread().join();
@@ -240,8 +260,13 @@ public class RemoteServer {
         registry.register(new com.mewcode.teams.TeamTools.TeamDeleteTool(teamManager));
         registry.register(new com.mewcode.teams.TeamTools.SendMessageTool(teamManager, "lead"));
 
-        // 权限检查器
-        permChecker = new PermissionChecker(PermissionMode.DEFAULT, Path.of(workDir));
+        // 权限检查器（模式取自配置，而非硬编码）
+        permChecker = new PermissionChecker(permissionMode, Path.of(workDir));
+        // 把生效的模式打出来：以前配置被硬编码覆盖，界面上看不出差异，配错了也不知道。
+        // 不再写「队友不设闸门」：队友现在有计划阶段的只读闸门（TeammateRunner
+        // .planAndAwaitApproval），只是那道闸门走工具白名单、不走 PermissionMode。
+        System.out.println("[remote] 权限模式: " + permissionMode
+                + "（作用于 lead；队友的计划阶段另有只读闸门，与此模式无关）");
 
         // Sidecar 指令服务（阶段 2）：运行中追加要求的收件与投递
         directiveService = new DirectiveService(new JsonlStore(
@@ -317,6 +342,11 @@ public class RemoteServer {
             if (teamManager.listTeams().isEmpty()) return true;
             return com.mewcode.teams.Coordinator.isCoordinatorTool(name);
         });
+
+        // 队友还在跑就不许收工。lead 的「本轮没有工具调用」既可能是活儿干完了，也可能
+        // 是正在等队友 —— 后者原先会被当成前者：lead 立刻 SUCCEEDED，终版报告写「无文件
+        // 改动记录」，而队友此刻正在写文件。判据详见 Agent.awaitBusyPeers / TeamManager.hasBusyTeammate。
+        agent.setPeersBusyFn(teamManager::hasBusyTeammate);
 
         // 子 Agent 关联
         if (registry.get("Agent") instanceof AgentTool at) {
@@ -779,6 +809,78 @@ public class RemoteServer {
     }
 
     // ────────────────────────────────────────────────────────────────────
+    // 团队邮箱轮询
+    // ────────────────────────────────────────────────────────────────────
+
+    /** 启动团队邮箱轮询线程。守护线程，随 JVM 退出而结束。 */
+    private void startMailboxPoller() {
+        mailboxPoller = Executors.newSingleThreadScheduledExecutor(r -> {
+            Thread t = new Thread(r, "team-mailbox-poller");
+            t.setDaemon(true);
+            return t;
+        });
+        mailboxPoller.scheduleWithFixedDelay(this::pollMailboxOnce,
+                MAILBOX_POLL_INTERVAL_MS, MAILBOX_POLL_INTERVAL_MS, TimeUnit.MILLISECONDS);
+        System.out.println("[remote] 团队邮箱轮询已启动（每 "
+                + (MAILBOX_POLL_INTERVAL_MS / 1000) + "s）");
+    }
+
+    /**
+     * 队友给 lead 的消息落盘在 .mewcode/teams/&lt;team&gt;/inboxes/lead.json，但
+     * notificationFn 只在 Agent.run() 的迭代内被调用（agent/Agent.java:218-223）——
+     * lead 主循环一旦结束就再没人唤醒它，队友的汇报会永远躺在邮箱里。TUI 靠
+     * MewCodeModel.java:387-415 的 MailboxPollMessage 解决了这点，remote 模式原先缺这一环，
+     * 这里补齐，行为与 TUI 对齐。
+     *
+     * <p>无 team 时直接返回，改动前行为不变。
+     */
+    private void pollMailboxOnce() {
+        try {
+            if (teamManager == null || agent == null) return; // initAgent 异常时的防御
+            if (teamManager.listTeams().isEmpty()) return;    // 无 team：零开销
+
+            // taskStartLock 是唯一的门：startAndConsumeTask 从 tryLock 一直持有到
+            // 整个 run 结束（consumeAgentEvents 在锁内），所以拿不到锁就说明 lead 正在跑。
+            // lead 在跑时无需唤醒 —— 它的 notificationFn 会在每个迭代点排空邮箱
+            // （agent/Agent.java:218-223），行为与 TUI 一致。
+            if (!taskStartLock.tryLock()) return;
+
+            try {
+                // 顺序很关键：drainLeadMailbox 会 markAllRead，一旦取走就没了。
+                // 所以必须先拿到锁再 drain，否则抢锁失败时消息会永久丢失。
+                var notes = new ArrayList<String>();
+                notes.addAll(com.mewcode.teams.TeammateRunner.drainLeadMailbox(teamManager));
+                if (subAgentTaskManager != null) {
+                    for (var n : subAgentTaskManager.drainNotifications()) {
+                        notes.add("<task-notification>Task %s: %s (%s)</task-notification>"
+                                .formatted(n.taskId(), n.name(), n.status()));
+                    }
+                }
+                if (notes.isEmpty()) return;
+
+                for (String note : notes) {
+                    conversation.addSystemReminder(note);
+                }
+                System.out.println("[remote] 队友消息到达，唤醒 lead（" + notes.size() + " 条）");
+                broadcast(Map.of("type", "system", "data",
+                        Map.of("message", "收到 %d 条队友/后台任务消息，正在唤醒 Lead…"
+                                .formatted(notes.size()))));
+
+                // 复用同一条启动+消费路径：事件照常 broadcast 到 WebSocket，
+                // 取消句柄照常挂到 activeTask。不能照 TUI 那样直接 agent.run(conversation)
+                // ——那会丢掉 cancel 句柄，且事件会堆进无人消费的队列（容量 64）把
+                // agent 线程永久阻塞在 put 上。
+                startTaskLocked();
+            } finally {
+                taskStartLock.unlock();
+            }
+        } catch (Exception e) {
+            // 必须吞掉所有异常：scheduleWithFixedDelay 在任务抛出后会永久停止调度。
+            // 轮询失败不应影响主流程，下一轮继续。
+        }
+    }
+
+    // ────────────────────────────────────────────────────────────────────
     // Agent 事件消费
     // ────────────────────────────────────────────────────────────────────
 
@@ -792,22 +894,77 @@ public class RemoteServer {
                     Map.of("message", "A task is already running")));
             return;
         }
-        streaming = true;
         try {
-            agentQueue = new LinkedBlockingQueue<>(64);
-            var handle = agent.runCancellable(conversation, agentQueue,
-                    "task-" + Long.toUnsignedString(System.nanoTime(), 36));
-            activeTask.set(handle);
-            if (askUserTool != null) askUserTool.setEventQueue(agentQueue);
-            try {
-                consumeAgentEvents(handle);
-            } finally {
-                activeTask.compareAndSet(handle, null);
-                streaming = false;
-                agentQueue = null;
-            }
+            startTaskLocked();
         } finally {
             taskStartLock.unlock();
+        }
+    }
+
+    /**
+     * 启动并消费一个任务。调用方<b>必须已持有</b> {@link #taskStartLock}。
+     *
+     * <p>拆出这个方法是为了让已在锁内的调用方（邮箱轮询）直接复用任务体，
+     * 不必再走一次 tryLock —— 虽然 ReentrantLock 重入成立、两次 unlock 也能配平，
+     * 但那样依赖 hold count 恰好对齐，很脆弱；改成显式的前置条件更安全。
+     */
+    private void startTaskLocked() {
+        streaming = true;
+        agentQueue = new LinkedBlockingQueue<>(64);
+        var handle = agent.runCancellable(conversation, agentQueue,
+                "task-" + Long.toUnsignedString(System.nanoTime(), 36));
+        activeTask.set(handle);
+        if (askUserTool != null) askUserTool.setEventQueue(agentQueue);
+
+        // 队友事件走**独立通道**，不混进 lead 的 agentQueue。
+        // 理由：putSafe 用的是阻塞 put，而 agentQueue 只有 64 槽 —— 12 个队友的
+        // 每轮埋点混进 lead 的高频流式事件里会互相挤占，甚至把队友线程阻塞在
+        // 没人及时消费的队列上。独立队列 + 独立消费线程对两边都无干扰。
+        teammateQueue = new LinkedBlockingQueue<>(256);
+        if (teamManager != null) teamManager.setTeammateEventSink(teammateQueue);
+        Thread teammateDrain = Thread.ofVirtual().name("teammate-event-drain").start(
+                () -> drainTeammateEvents(handle));
+
+        try {
+            consumeAgentEvents(handle);
+        } finally {
+            if (teamManager != null) teamManager.setTeammateEventSink(null);
+            teammateQueue = null;
+            teammateDrain.interrupt();
+            activeTask.compareAndSet(handle, null);
+            streaming = false;
+            agentQueue = null;
+        }
+    }
+
+    /**
+     * 把队友的 token 埋点广播出去。
+     *
+     * <p>队友此前只有两条外流旁路（{@code progress.jsonl} 与邮箱），外部观测不到
+     * 多 agent 的真实成本。这条通道让实验驱动能按时刻累计各队友的消耗。
+     *
+     * <p>只消费 {@code TeammateUsageEvent}：队友的流式文本/工具事件对远端没有意义，
+     * 转发它们只会把 ws 淹掉。
+     */
+    private void drainTeammateEvents(TaskExecutionHandle handle) {
+        while (!Thread.currentThread().isInterrupted()) {
+            try {
+                var q = teammateQueue;
+                if (q == null) return;
+                AgentEvent event = q.poll(500, TimeUnit.MILLISECONDS);
+                if (event instanceof AgentEvent.TeammateUsageEvent e) {
+                    broadcast(Map.of("type", "teammate_usage", "data", Map.of(
+                            "team", e.team(),
+                            "member", e.member(),
+                            "turn", e.turn(),
+                            "deltaTokens", e.deltaTokens())));
+                } else if (event == null && handle != null && handle.isDone() && q.isEmpty()) {
+                    return;
+                }
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                return;
+            }
         }
     }
 

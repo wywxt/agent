@@ -53,7 +53,12 @@
       "Bash(ls -la __TRACKED_VAR__/.mewcode/)",
       "Bash(ls -la ~/.mewcode/)",
       "Bash(find .mewcode -maxdepth 2 -name \"*.yaml\" -o -maxdepth 2 -name \"*.yml\")",
-      "Bash(ls -la build/libs/)"
+      "Bash(ls -la build/libs/)",
+      "Read(//d/preoject/agent project/**)",
+      "Read(//d/preoject/agent project/team-e2e-harness/**)",
+      "Read(//d/preoject/agent project/team-e2e/**)",
+      "Bash(tasklist)",
+      "Bash(date; echo *)"
     ]
   }
 }

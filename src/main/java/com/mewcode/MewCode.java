@@ -84,7 +84,8 @@ public class MewCode {
                     config.getHooks() != null ? config.getHooks() : List.of(),
                     remoteAddr,
                     config.isEnableCoordinatorMode(),
-                    config.getReportProvider()
+                    config.getReportProvider(),
+                    com.mewcode.permission.PermissionMode.fromConfig(config.getPermissionMode())
             );
             try {
                 server.run();
@@ -100,7 +101,8 @@ public class MewCode {
                 config.getProviders(),
                 config.getMcpServers() != null ? config.getMcpServers() : List.of(),
                 config.getHooks() != null ? config.getHooks() : List.of(),
-                config.isEnableCoordinatorMode()
+                config.isEnableCoordinatorMode(),
+                com.mewcode.permission.PermissionMode.fromConfig(config.getPermissionMode())
         );
 
         var program = new Program(model);

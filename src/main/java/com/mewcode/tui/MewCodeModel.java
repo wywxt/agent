@@ -76,6 +76,8 @@ public class MewCodeModel implements Model {
     private final List<McpServerConfig> mcpServers;
     private final List<HookConfig> hookConfigs;
     private final boolean enableCoordinatorMode;
+    /** 权限模式，来自配置的 {@code permission_mode}（以前硬编码 DEFAULT，配置不生效）。 */
+    private final PermissionMode permissionMode;
     private HookEngine hookEngine;
     private int providerCursor;
     private ProviderConfig selectedProvider;
@@ -223,11 +225,13 @@ public class MewCodeModel implements Model {
     public record MailboxPollMessage() implements Message {}
 
     public MewCodeModel(List<ProviderConfig> providers, List<McpServerConfig> mcpServers,
-                        List<HookConfig> hookConfigs, boolean enableCoordinatorMode) {
+                        List<HookConfig> hookConfigs, boolean enableCoordinatorMode,
+                        PermissionMode permissionMode) {
         this.providers = providers != null ? providers : List.of();
         this.mcpServers = mcpServers != null ? mcpServers : List.of();
         this.hookConfigs = hookConfigs != null ? hookConfigs : List.of();
         this.enableCoordinatorMode = enableCoordinatorMode;
+        this.permissionMode = permissionMode != null ? permissionMode : PermissionMode.DEFAULT;
         if (this.providers.size() == 1) {
             this.selectedProvider = this.providers.get(0);
             this.state = AppState.CHAT;
@@ -539,7 +543,7 @@ public class MewCodeModel implements Model {
             registry.register(new com.mewcode.teams.TeamTools.SendMessageTool(teamManager, "lead"));
 
             permChecker = new PermissionChecker(
-                    PermissionMode.DEFAULT, Path.of(workDir));
+                    permissionMode, Path.of(workDir));
 
             // 初始化 OS 级沙箱
             sandboxInstance = com.mewcode.sandbox.SandboxFactory.create();
